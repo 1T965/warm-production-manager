@@ -1,0 +1,1416 @@
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime
+
+db = SQLAlchemy()
+
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    phone = db.Column(db.String(20), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    name = db.Column(db.String(100))
+    is_admin = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+class Clothing(db.Model):
+    __tablename__ = 'clothing'
+    id = db.Column(db.Integer, primary_key=True)
+    code = db.Column(db.String(50), unique=True, nullable=False)
+    name = db.Column(db.String(100))
+    image = db.Column(db.String(255))
+    description = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Material(db.Model):
+    __tablename__ = 'materials'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    type = db.Column(db.String(50))  # 'fabric' or 'accessory'
+    unit = db.Column(db.String(20))
+    unit_price = db.Column(db.Float, nullable=False)
+    description = db.Column(db.Text)
+
+class Procurement(db.Model):
+    __tablename__ = 'procurement'
+    id = db.Column(db.Integer, primary_key=True)
+    clothing_id = db.Column(db.Integer, db.ForeignKey('clothing.id'), nullable=False)
+    planned_quantity = db.Column(db.Integer, nullable=False)
+    unit_cost = db.Column(db.Float, nullable=False)
+    status = db.Column(db.String(20), default='pending')
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, onupdate=datetime.utcnow)
+    
+    clothing = db.relationship('Clothing', backref='procurements')
+    materials = db.relationship('ProcurementMaterial', backref='procurement')
+
+class ProcurementMaterial(db.Model):
+    __tablename__ = 'procurement_materials'
+    id = db.Column(db.Integer, primary_key=True)
+    procurement_id = db.Column(db.Integer, db.ForeignKey('procurement.id'), nullable=False)
+    material_id = db.Column(db.Integer, db.ForeignKey('materials.id'), nullable=False)
+    quantity_per_unit = db.Column(db.Float, nullable=False)
+    
+    material = db.relationship('Material')
+
+class Production(db.Model):
+    __tablename__ = 'production'
+    id = db.Column(db.Integer, primary_key=True)
+    clothing_id = db.Column(db.Integer, db.ForeignKey('clothing.id'), nullable=False)
+    planned_quantity = db.Column(db.Integer, nullable=False)
+    actual_quantity = db.Column(db.Integer)
+    status = db.Column(db.String(20), default='pending')  # pending, in_progress, completed
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, onupdate=datetime.utcnow)
+    
+    clothing = db.relationship('Clothing', backref='productions')
+    processes = db.relationship('ProductionProcess', backref='production')
+
+class ProductionProcess(db.Model):
+    __tablename__ = 'production_processes'
+    id = db.Column(db.Integer, primary_key=True)
+    production_id = db.Column(db.Integer, db.ForeignKey('production.id'), nullable=False)
+    process_name = db.Column(db.String(100), nullable=False)
+    worker_name = db.Column(db.String(100), nullable=False)
+    unit_price = db.Column(db.Float, nullable=False)
+    sequence = db.Column(db.Integer, nullable=False)
+
+class Inventory(db.Model):
+    __tablename__ = 'inventory'
+    id = db.Column(db.Integer, primary_key=True)
+    production_id = db.Column(db.Integer, db.ForeignKey('production.id'), nullable=False)
+    actual_quantity = db.Column(db.Integer, nullable=False)
+    defective_quantity = db.Column(db.Integer, default=0)
+    defective_recycled = db.Column(db.Boolean, default=False)
+    notes = db.Column(db.Text)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    production = db.relationship('Production', backref='inventory')
+    import os
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+from models import db, User, Clothing, Material, Procurement, ProcurementMaterial, Production, ProductionProcess, Inventory
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from datetime import datetime
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///warm_production.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+
+# Initialize db
+db.init_app(app)
+
+# Create tables
+with app.app_context():
+    db.create_all()
+    # Create default admin user if not exists
+    if not User.query.filter_by(phone='admin').first():
+        admin = User(phone='admin', name='Admin', is_admin=True)
+        admin.set_password('123456')
+        db.session.add(admin)
+        db.session.commit()
+
+@app.route('/')
+def home():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    return redirect(url_for('dashboard'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        phone = request.form.get('phone')
+        password = request.form.get('password')
+        remember = request.form.get('remember')
+        
+        user = User.query.filter_by(phone=phone).first()
+        
+        if user and user.check_password(password):
+            session['user_id'] = user.id
+            session['user_name'] = user.name
+            session['is_admin'] = user.is_admin
+            
+            if remember:
+                session.permanent = True
+            else:
+                session.permanent = False
+            
+            flash('登录成功!', 'success')
+            return redirect(url_for('dashboard'))
+        else:
+            flash('电话号码或密码错误', 'danger')
+    
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('您已成功退出', 'success')
+    return redirect(url_for('login'))
+
+@app.route('/dashboard')
+def dashboard():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    # Get counts for dashboard
+    procurement_count = Procurement.query.count()
+    production_count = Production.query.count()
+    inventory_count = Inventory.query.count()
+    
+    # Recent activities
+    recent_procurements = Procurement.query.order_by(Procurement.created_at.desc()).limit(5).all()
+    recent_productions = Production.query.order_by(Production.created_at.desc()).limit(5).all()
+    
+    return render_template('dashboard.html', 
+                         procurement_count=procurement_count,
+                         production_count=production_count,
+                         inventory_count=inventory_count,
+                         recent_procurements=recent_procurements,
+                         recent_productions=recent_productions)
+
+# Procurement Routes
+@app.route('/procurement')
+def procurement_list():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    procurements = Procurement.query.all()
+    return render_template('procurement/list.html', procurements=procurements)
+
+@app.route('/procurement/add', methods=['GET', 'POST'])
+def procurement_add():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    if request.method == 'POST':
+        try:
+            # Get form data
+            clothing_code = request.form.get('clothing_code')
+            planned_quantity = int(request.form.get('planned_quantity'))
+            
+            # Find or create clothing
+            clothing = Clothing.query.filter_by(code=clothing_code).first()
+            if not clothing:
+                clothing = Clothing(
+                    code=clothing_code,
+                    name=request.form.get('clothing_name'),
+                    description=request.form.get('clothing_description')
+                )
+                db.session.add(clothing)
+                db.session.flush()  # To get the id
+            
+            # Handle file upload
+            if 'clothing_image' in request.files:
+                file = request.files['clothing_image']
+                if file.filename != '':
+                    filename = secure_filename(file.filename)
+                    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    file.save(filepath)
+                    clothing.image = filename
+            
+            # Create procurement
+            procurement = Procurement(
+                clothing_id=clothing.id,
+                planned_quantity=planned_quantity,
+                unit_cost=float(request.form.get('unit_cost')),
+                created_by=session['user_id']
+            )
+            db.session.add(procurement)
+            db.session.flush()
+            
+            # Add materials
+            fabric_names = request.form.getlist('fabric_name[]')
+            fabric_quantities = request.form.getlist('fabric_quantity[]')
+            fabric_prices = request.form.getlist('fabric_price[]')
+            
+            for name, qty, price in zip(fabric_names, fabric_quantities, fabric_prices):
+                if name and qty and price:
+                    material = Material.query.filter_by(name=name, type='fabric').first()
+                    if not material:
+                        material = Material(
+                            name=name,
+                            type='fabric',
+                            unit='meter',
+                            unit_price=float(price)
+                        )
+                        db.session.add(material)
+                        db.session.flush()
+                    
+                    procurement_material = ProcurementMaterial(
+                        procurement_id=procurement.id,
+                        material_id=material.id,
+                        quantity_per_unit=float(qty)
+                    )
+                    db.session.add(procurement_material)
+            
+            # Add accessories
+            accessory_names = request.form.getlist('accessory_name[]')
+            accessory_quantities = request.form.getlist('accessory_quantity[]')
+            accessory_prices = request.form.getlist('accessory_price[]')
+            
+            for name, qty, price in zip(accessory_names, accessory_quantities, accessory_prices):
+                if name and qty and price:
+                    material = Material.query.filter_by(name=name, type='accessory').first()
+                    if not material:
+                        material = Material(
+                            name=name,
+                            type='accessory',
+                            unit='piece',
+                            unit_price=float(price)
+                        )
+                        db.session.add(material)
+                        db.session.flush()
+                    
+                    procurement_material = ProcurementMaterial(
+                        procurement_id=procurement.id,
+                        material_id=material.id,
+                        quantity_per_unit=float(qty)
+                    )
+                    db.session.add(procurement_material)
+            
+            db.session.commit()
+            flash('采购计划添加成功', 'success')
+            return redirect(url_for('procurement_list'))
+        
+        except Exception as e:
+            db.session.rollback()
+            flash(f'添加失败: {str(e)}', 'danger')
+    
+    return render_template('procurement/add.html')
+
+# Production Routes
+@app.route('/production')
+def production_list():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    productions = Production.query.all()
+    return render_template('production/list.html', productions=productions)
+
+@app.route('/production/add', methods=['GET', 'POST'])
+def production_add():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    if request.method == 'POST':
+        try:
+            clothing_code = request.form.get('clothing_code')
+            planned_quantity = int(request.form.get('planned_quantity'))
+            
+            clothing = Clothing.query.filter_by(code=clothing_code).first()
+            if not clothing:
+                flash('服装款号不存在', 'danger')
+                return redirect(url_for('production_add'))
+            
+            production = Production(
+                clothing_id=clothing.id,
+                planned_quantity=planned_quantity,
+                created_by=session['user_id']
+            )
+            db.session.add(production)
+            db.session.flush()
+            
+            # Add production processes
+            process_names = request.form.getlist('process_name[]')
+            worker_names = request.form.getlist('worker_name[]')
+            unit_prices = request.form.getlist('unit_price[]')
+            sequences = request.form.getlist('sequence[]')
+            
+            for name, worker, price, seq in zip(process_names, worker_names, unit_prices, sequences):
+                if name and worker and price and seq:
+                    process = ProductionProcess(
+                        production_id=production.id,
+                        process_name=name,
+                        worker_name=worker,
+                        unit_price=float(price),
+                        sequence=int(seq)
+                    )
+                    db.session.add(process)
+            
+            db.session.commit()
+            flash('生产计划添加成功', 'success')
+            return redirect(url_for('production_list'))
+        
+        except Exception as e:
+            db.session.rollback()
+            flash(f'添加失败: {str(e)}', 'danger')
+    
+    return render_template('production/add.html')
+
+# Inventory Routes
+@app.route('/inventory')
+def inventory_list():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    inventories = Inventory.query.all()
+    return render_template('inventory/list.html', inventories=inventories)
+
+@app.route('/inventory/add/<int:production_id>', methods=['GET', 'POST'])
+def inventory_add(production_id):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    production = Production.query.get_or_404(production_id)
+    
+    if request.method == 'POST':
+        try:
+            actual_quantity = int(request.form.get('actual_quantity'))
+            defective_quantity = int(request.form.get('defective_quantity', 0))
+            defective_recycled = True if request.form.get('defective_recycled') == 'on' else False
+            notes = request.form.get('notes')
+            
+            inventory = Inventory(
+                production_id=production.id,
+                actual_quantity=actual_quantity,
+                defective_quantity=defective_quantity,
+                defective_recycled=defective_recycled,
+                notes=notes,
+                created_by=session['user_id']
+            )
+            db.session.add(inventory)
+            
+            # Update production status
+            production.actual_quantity = actual_quantity
+            production.status = 'completed'
+            
+            db.session.commit()
+            flash('入库记录添加成功', 'success')
+            return redirect(url_for('inventory_list'))
+        
+        except Exception as e:
+            db.session.rollback()
+            flash(f'添加失败: {str(e)}', 'danger')
+    
+    return render_template('inventory/add.html', production=production)
+
+# Cost Calculation
+@app.route('/cost/<int:clothing_id>')
+def cost_calculation(clothing_id):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    clothing = Clothing.query.get_or_404(clothing_id)
+    
+    # Calculate procurement costs
+    procurement_costs = []
+    total_procurement_cost = 0
+    
+    for procurement in clothing.procurements:
+        cost = procurement.unit_cost * procurement.planned_quantity
+        procurement_costs.append({
+            'id': procurement.id,
+            'planned_quantity': procurement.planned_quantity,
+            'unit_cost': procurement.unit_cost,
+            'total_cost': cost
+        })
+        total_procurement_cost += cost
+    
+    # Calculate production costs
+    production_costs = []
+    total_production_cost = 0
+    
+    for production in clothing.productions:
+        cost = 0
+        for process in production.processes:
+            cost += process.unit_price * (production.actual_quantity or production.planned_quantity)
+        
+        production_costs.append({
+            'id': production.id,
+            'quantity': production.actual_quantity or production.planned_quantity,
+            'processes': len(production.processes),
+            'total_cost': cost
+        })
+        total_production_cost += cost
+    
+    # Calculate total cost
+    total_cost = total_procurement_cost + total_production_cost
+    
+    return render_template('cost.html',
+                         clothing=clothing,
+                         procurement_costs=procurement_costs,
+                         total_procurement_cost=total_procurement_cost,
+                         production_costs=production_costs,
+                         total_production_cost=total_production_cost,
+                         total_cost=total_cost)
+
+# API for clothing search
+@app.route('/api/clothing/search')
+def api_clothing_search():
+    query = request.args.get('q', '')
+    clothings = Clothing.query.filter(Clothing.code.like(f'%{query}%')).limit(10).all()
+    results = [{'id': c.id, 'code': c.code, 'name': c.name} for c in clothings]
+    return jsonify(results)
+
+if __name__ == '__main__':
+    app.run(debug=True)
+  <!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}暖暖生产管理大师{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.0/font/bootstrap-icons.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    {% block extra_css %}{% endblock %}
+</head>
+<body>
+    <div class="wrapper">
+        <!-- Sidebar -->
+        <nav id="sidebar" class="bg-dark">
+            <div class="sidebar-header text-center py-4">
+                <h3 class="text-light">暖暖生产管理大师</h3>
+            </div>
+            
+            <ul class="list-unstyled components">
+                <li>
+                    <a href="{{ url_for('dashboard') }}" class="text-light">
+                        <i class="bi bi-speedometer2 me-2"></i>仪表盘
+                    </a>
+                </li>
+                <li>
+                    <a href="#procurementSubmenu" data-bs-toggle="collapse" aria-expanded="false" class="dropdown-toggle text-light">
+                        <i class="bi bi-cart-plus me-2"></i>采购管理
+                    </a>
+                    <ul class="collapse list-unstyled" id="procurementSubmenu">
+                        <li>
+                            <a href="{{ url_for('procurement_list') }}" class="text-light">采购列表</a>
+                        </li>
+                        <li>
+                            <a href="{{ url_for('procurement_add') }}" class="text-light">添加采购</a>
+                        </li>
+                    </ul>
+                </li>
+                <li>
+                    <a href="#productionSubmenu" data-bs-toggle="collapse" aria-expanded="false" class="dropdown-toggle text-light">
+                        <i class="bi bi-gear me-2"></i>生产管理
+                    </a>
+                    <ul class="collapse list-unstyled" id="productionSubmenu">
+                        <li>
+                            <a href="{{ url_for('production_list') }}" class="text-light">生产列表</a>
+                        </li>
+                        <li>
+                            <a href="{{ url_for('production_add') }}" class="text-light">添加生产</a>
+                        </li>
+                    </ul>
+                </li>
+                <li>
+                    <a href="#inventorySubmenu" data-bs-toggle="collapse" aria-expanded="false" class="dropdown-toggle text-light">
+                        <i class="bi bi-box-seam me-2"></i>入库管理
+                    </a>
+                    <ul class="collapse list-unstyled" id="inventorySubmenu">
+                        <li>
+                            <a href="{{ url_for('inventory_list') }}" class="text-light">入库列表</a>
+                        </li>
+                    </ul>
+                </li>
+            </ul>
+        </nav>
+
+        <!-- Page Content -->
+        <div id="content">
+            <nav class="navbar navbar-expand-lg navbar-light bg-light">
+                <div class="container-fluid">
+                    <button type="button" id="sidebarCollapse" class="btn btn-dark">
+                        <i class="bi bi-list"></i>
+                    </button>
+                    
+                    <div class="ms-auto">
+                        <span class="navbar-text me-3">
+                            欢迎, {{ session.get('user_name', '用户') }}
+                        </span>
+                        <a href="{{ url_for('logout') }}" class="btn btn-outline-danger btn-sm">
+                            <i class="bi bi-box-arrow-right"></i> 退出
+                        </a>
+                    </div>
+                </div>
+            </nav>
+            
+            <!-- Flash Messages -->
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }} alert-dismissible fade show mx-3 mt-3" role="alert">
+                            {{ message }}
+                            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                        </div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+            
+            <!-- Page Content -->
+            <div class="container-fluid px-4 py-3">
+                {% block content %}{% endblock %}
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    {% block extra_js %}{% endblock %}
+</body>
+</html>
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row justify-content-center mt-5">
+    <div class="col-md-6 col-lg-4">
+        <div class="card shadow">
+            <div class="card-body p-5">
+                <h2 class="card-title text-center mb-4">暖暖生产管理大师</h2>
+                <form method="POST" action="{{ url_for('login') }}">
+                    <div class="mb-3">
+                        <label for="phone" class="form-label">电话号码</label>
+                        <input type="text" class="form-control" id="phone" name="phone" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="password" class="form-label">密码</label>
+                        <input type="password" class="form-control" id="password" name="password" required>
+                    </div>
+                    <div class="mb-3 form-check">
+                        <input type="checkbox" class="form-check-input" id="remember" name="remember">
+                        <label class="form-check-label" for="remember">记住我</label>
+                    </div>
+                    <div class="d-grid">
+                        <button type="submit" class="btn btn-primary">登录</button>
+                    </div>
+                </form>
+                <div class="mt-3 text-center">
+                    <p>默认密码: 123456</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+  {% extends "base.html" %}
+
+{% block title %}仪表盘 - 暖暖生产管理大师{% endblock %}
+
+{% block content %}
+<h2 class="mb-4">仪表盘</h2>
+
+<div class="row mb-4">
+    <div class="col-md-4">
+        <div class="card text-white bg-primary mb-3">
+            <div class="card-body">
+                <h5 class="card-title">采购计划</h5>
+                <p class="card-text display-6">{{ procurement_count }}</p>
+                <a href="{{ url_for('procurement_list') }}" class="text-white">查看详情 <i class="bi bi-arrow-right"></i></a>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card text-white bg-success mb-3">
+            <div class="card-body">
+                <h5 class="card-title">生产计划</h5>
+                <p class="card-text display-6">{{ production_count }}</p>
+                <a href="{{ url_for('production_list') }}" class="text-white">查看详情 <i class="bi bi-arrow-right"></i></a>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card text-white bg-info mb-3">
+            <div class="card-body">
+                <h5 class="card-title">入库记录</h5>
+                <p class="card-text display-6">{{ inventory_count }}</p>
+                <a href="{{ url_for('inventory_list') }}" class="text-white">查看详情 <i class="bi bi-arrow-right"></i></a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-6">
+        <div class="card mb-4">
+            <div class="card-header bg-light">
+                <h5 class="mb-0">最近采购计划</h5>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead>
+                            <tr>
+                                <th>款号</th>
+                                <th>计划数量</th>
+                                <th>状态</th>
+                                <th>日期</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for procurement in recent_procurements %}
+                            <tr>
+                                <td>{{ procurement.clothing.code }}</td>
+                                <td>{{ procurement.planned_quantity }}</td>
+                                <td>
+                                    <span class="badge bg-{{ 'success' if procurement.status == 'completed' else 'warning' }}">
+                                        {{ procurement.status }}
+                                    </span>
+                                </td>
+                                <td>{{ procurement.created_at.strftime('%Y-%m-%d') }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-6">
+        <div class="card mb-4">
+            <div class="card-header bg-light">
+                <h5 class="mb-0">最近生产计划</h5>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead>
+                            <tr>
+                                <th>款号</th>
+                                <th>计划数量</th>
+                                <th>状态</th>
+                                <th>日期</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for production in recent_productions %}
+                            <tr>
+                                <td>{{ production.clothing.code }}</td>
+                                <td>{{ production.planned_quantity }}</td>
+                                <td>
+                                    <span class="badge bg-{{ 'success' if production.status == 'completed' else 'warning' }}">
+                                        {{ production.status }}
+                                    </span>
+                                </td>
+                                <td>{{ production.created_at.strftime('%Y-%m-%d') }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+  {% extends "base.html" %}
+
+{% block title %}采购管理 - 暖暖生产管理大师{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>采购计划列表</h2>
+    <a href="{{ url_for('procurement_add') }}" class="btn btn-primary">
+        <i class="bi bi-plus-lg"></i> 添加采购计划
+    </a>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover">
+                <thead class="table-light">
+                    <tr>
+                        <th>ID</th>
+                        <th>服装款号</th>
+                        <th>服装名称</th>
+                        <th>计划数量</th>
+                        <th>单件成本</th>
+                        <th>总成本</th>
+                        <th>状态</th>
+                        <th>创建日期</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for procurement in procurements %}
+                    <tr>
+                        <td>{{ procurement.id }}</td>
+                        <td>{{ procurement.clothing.code }}</td>
+                        <td>{{ procurement.clothing.name }}</td>
+                        <td>{{ procurement.planned_quantity }}</td>
+                        <td>¥{{ "%.2f"|format(procurement.unit_cost) }}</td>
+                        <td>¥{{ "%.2f"|format(procurement.unit_cost * procurement.planned_quantity) }}</td>
+                        <td>
+                            <span class="badge bg-{{ 'success' if procurement.status == 'completed' else 'warning' }}">
+                                {{ procurement.status }}
+                            </span>
+                        </td>
+                        <td>{{ procurement.created_at.strftime('%Y-%m-%d') }}</td>
+                        <td>
+                            <a href="{{ url_for('cost_calculation', clothing_id=procurement.clothing.id) }}" class="btn btn-sm btn-info" title="成本计算">
+                                <i class="bi bi-calculator"></i>
+                            </a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+  {% extends "base.html" %}
+
+{% block title %}添加采购计划 - 暖暖生产管理大师{% endblock %}
+
+{% block extra_js %}
+<script>
+$(document).ready(function() {
+    // Add fabric row
+    $('#add-fabric').click(function() {
+        const newRow = `
+        <div class="row fabric-row mb-2">
+            <div class="col-md-4">
+                <input type="text" class="form-control" name="fabric_name[]" placeholder="布料名称" required>
+            </div>
+            <div class="col-md-3">
+                <input type="number" step="0.01" class="form-control" name="fabric_quantity[]" placeholder="单件用量" required>
+            </div>
+            <div class="col-md-3">
+                <input type="number" step="0.01" class="form-control" name="fabric_price[]" placeholder="单价" required>
+            </div>
+            <div class="col-md-2">
+                <button type="button" class="btn btn-danger remove-row"><i class="bi bi-trash"></i></button>
+            </div>
+        </div>`;
+        $('#fabric-container').append(newRow);
+    });
+    
+    // Add accessory row
+    $('#add-accessory').click(function() {
+        const newRow = `
+        <div class="row accessory-row mb-2">
+            <div class="col-md-4">
+                <input type="text" class="form-control" name="accessory_name[]" placeholder="辅料名称" required>
+            </div>
+            <div class="col-md-3">
+                <input type="number" step="0.01" class="form-control" name="accessory_quantity[]" placeholder="单件用量" required>
+            </div>
+            <div class="col-md-3">
+                <input type="number" step="0.01" class="form-control" name="accessory_price[]" placeholder="单价" required>
+            </div>
+            <div class="col-md-2">
+                <button type="button" class="btn btn-danger remove-row"><i class="bi bi-trash"></i></button>
+            </div>
+        </div>`;
+        $('#accessory-container').append(newRow);
+    });
+    
+    // Remove row
+    $(document).on('click', '.remove-row', function() {
+        $(this).closest('.row').remove();
+    });
+    
+    // Clothing code search
+    $('#clothing_code').on('input', function() {
+        const query = $(this).val();
+        if (query.length > 2) {
+            $.get('/api/clothing/search', {q: query}, function(data) {
+                const results = data;
+                let html = '';
+                results.forEach(item => {
+                    html += `<div class="list-group-item list-group-item-action" data-code="${item.code}" data-name="${item.name}">
+                                ${item.code} - ${item.name}
+                            </div>`;
+                });
+                $('#clothing-results').html(html).show();
+            });
+        } else {
+            $('#clothing-results').hide();
+        }
+    });
+    
+    // Select clothing from search results
+    $(document).on('click', '#clothing-results .list-group-item', function() {
+        const code = $(this).data('code');
+        const name = $(this).data('name');
+        $('#clothing_code').val(code);
+        $('#clothing_name').val(name);
+        $('#clothing-results').hide();
+    });
+});
+</script>
+{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>添加采购计划</h2>
+    <a href="{{ url_for('procurement_list') }}" class="btn btn-outline-secondary">
+        <i class="bi bi-arrow-left"></i> 返回列表
+    </a>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <form method="POST" enctype="multipart/form-data">
+            <h5 class="card-title mb-4">服装信息</h5>
+            
+            <div class="row mb-3">
+                <div class="col-md-6">
+                    <label for="clothing_code" class="form-label">服装款号</label>
+                    <input type="text" class="form-control" id="clothing_code" name="clothing_code" required>
+                    <div id="clothing-results" class="list-group mt-1" style="display: none; position: absolute; z-index: 1000; width: 100%;"></div>
+                </div>
+                <div class="col-md-6">
+                    <label for="clothing_name" class="form-label">服装名称</label>
+                    <input type="text" class="form-control" id="clothing_name" name="clothing_name">
+                </div>
+            </div>
+            
+            <div class="row mb-3">
+                <div class="col-md-6">
+                    <label for="clothing_image" class="form-label">服装图片</label>
+                    <input type="file" class="form-control" id="clothing_image" name="clothing_image" accept="image/*">
+                </div>
+                <div class="col-md-6">
+                    <label for="planned_quantity" class="form-label">计划采购数量</label>
+                    <input type="number" class="form-control" id="planned_quantity" name="planned_quantity" required>
+                </div>
+            </div>
+            
+            <div class="mb-3">
+                <label for="clothing_description" class="form-label">描述</label>
+                <textarea class="form-control" id="clothing_description" name="clothing_description" rows="2"></textarea>
+            </div>
+            
+            <hr class="my-4">
+            <h5 class="card-title mb-4">成本信息</h5>
+            
+            <div class="mb-3">
+                <label class="form-label">单件成本</label>
+                <input type="number" step="0.01" class="form-control" name="unit_cost" required>
+            </div>
+            
+            <hr class="my-4">
+            <h5 class="card-title mb-4">布料信息</h5>
+            
+            <div id="fabric-container">
+                <div class="row fabric-row mb-2">
+                    <div class="col-md-4">
+                        <input type="text" class="form-control" name="fabric_name[]" placeholder="布料名称" required>
+                    </div>
+                    <div class="col-md-3">
+                        <input type="number" step="0.01" class="form-control" name="fabric_quantity[]" placeholder="单件用量" required>
+                    </div>
+                    <div class="col-md-3">
+                        <input type="number" step="0.01" class="form-control" name="fabric_price[]" placeholder="单价" required>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="button" class="btn btn-danger remove-row"><i class="bi bi-trash"></i></button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="mb-3">
+                <button type="button" id="add-fabric" class="btn btn-sm btn-outline-primary">
+                    <i class="bi bi-plus"></i> 添加布料
+                </button>
+            </div>
+            
+            <hr class="my-4">
+            <h5 class="card-title mb-4">辅料信息</h5>
+            
+            <div id="accessory-container">
+                <div class="row accessory-row mb-2">
+                    <div class="col-md-4">
+                        <input type="text" class="form-control" name="accessory_name[]" placeholder="辅料名称" required>
+                    </div>
+                    <div class="col-md-3">
+                        <input type="number" step="0.01" class="form-control" name="accessory_quantity[]" placeholder="单件用量" required>
+                    </div>
+                    <div class="col-md-3">
+                        <input type="number" step="0.01" class="form-control" name="accessory_price[]" placeholder="单价" required>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="button" class="btn btn-danger remove-row"><i class="bi bi-trash"></i></button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="mb-3">
+                <button type="button" id="add-accessory" class="btn btn-sm btn-outline-primary">
+                    <i class="bi bi-plus"></i> 添加辅料
+                </button>
+            </div>
+            
+            <div class="d-grid gap-2 d-md-flex justify-content-md-end mt-4">
+                <button type="submit" class="btn btn-primary">提交</button>
+                <button type="reset" class="btn btn-outline-secondary">重置</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+  {% extends "base.html" %}
+
+{% block title %}生产管理 - 暖暖生产管理大师{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>生产计划列表</h2>
+    <a href="{{ url_for('production_add') }}" class="btn btn-primary">
+        <i class="bi bi-plus-lg"></i> 添加生产计划
+    </a>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover">
+                <thead class="table-light">
+                    <tr>
+                        <th>ID</th>
+                        <th>服装款号</th>
+                        <th>服装名称</th>
+                        <th>计划数量</th>
+                        <th>实际数量</th>
+                        <th>工序数量</th>
+                        <th>状态</th>
+                        <th>创建日期</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for production in productions %}
+                    <tr>
+                        <td>{{ production.id }}</td>
+                        <td>{{ production.clothing.code }}</td>
+                        <td>{{ production.clothing.name }}</td>
+                        <td>{{ production.planned_quantity }}</td>
+                        <td>{{ production.actual_quantity or '-' }}</td>
+                        <td>{{ production.processes|length }}</td>
+                        <td>
+                            <span class="badge bg-{{ 'success' if production.status == 'completed' else 'warning' }}">
+                                {{ production.status }}
+                            </span>
+                        </td>
+                        <td>{{ production.created_at.strftime('%Y-%m-%d') }}</td>
+                        <td>
+                            {% if production.status != 'completed' %}
+                            <a href="{{ url_for('inventory_add', production_id=production.id) }}" class="btn btn-sm btn-success" title="入库">
+                                <i class="bi bi-box-arrow-in-down"></i>
+                            </a>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+  {% extends "base.html" %}
+
+{% block title %}添加生产计划 - 暖暖生产管理大师{% endblock %}
+
+{% block extra_js %}
+<script>
+$(document).ready(function() {
+    // Add process row
+    $('#add-process').click(function() {
+        const newRow = `
+        <div class="row process-row mb-2">
+            <div class="col-md-3">
+                <input type="text" class="form-control" name="process_name[]" placeholder="工序名称" required>
+            </div>
+            <div class="col-md-3">
+                <input type="text" class="form-control" name="worker_name[]" placeholder="工人姓名" required>
+            </div>
+            <div class="col-md-2">
+                <input type="number" step="0.01" class="form-control" name="unit_price[]" placeholder="单价" required>
+            </div>
+            <div class="col-md-2">
+                <input type="number" class="form-control" name="sequence[]" placeholder="顺序" required>
+            </div>
+            <div class="col-md-2">
+                <button type="button" class="btn btn-danger remove-row"><i class="bi bi-trash"></i></button>
+            </div>
+        </div>`;
+        $('#process-container').append(newRow);
+    });
+    
+    // Remove row
+    $(document).on('click', '.remove-row', function() {
+        $(this).closest('.row').remove();
+    });
+    
+    // Clothing code search
+    $('#clothing_code').on('input', function() {
+        const query = $(this).val();
+        if (query.length > 2) {
+            $.get('/api/clothing/search', {q: query}, function(data) {
+                const results = data;
+                let html = '';
+                results.forEach(item => {
+                    html += `<div class="list-group-item list-group-item-action" data-code="${item.code}">
+                                ${item.code} - ${item.name}
+                            </div>`;
+                });
+                $('#clothing-results').html(html).show();
+            });
+        } else {
+            $('#clothing-results').hide();
+        }
+    });
+    
+    // Select clothing from search results
+    $(document).on('click', '#clothing-results .list-group-item', function() {
+        const code = $(this).data('code');
+        $('#clothing_code').val(code);
+        $('#clothing-results').hide();
+    });
+});
+</script>
+{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>添加生产计划</h2>
+    <a href="{{ url_for('production_list') }}" class="btn btn-outline-secondary">
+        <i class="bi bi-arrow-left"></i> 返回列表
+    </a>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <form method="POST">
+            <h5 class="card-title mb-4">基本信息</h5>
+            
+            <div class="row mb-3">
+                <div class="col-md-6">
+                    <label for="clothing_code" class="form-label">服装款号</label>
+                    <input type="text" class="form-control" id="clothing_code" name="clothing_code" required>
+                    <div id="clothing-results" class="list-group mt-1" style="display: none; position: absolute; z-index: 1000; width: 100%;"></div>
+                </div>
+                <div class="col-md-6">
+                    <label for="planned_quantity" class="form-label">计划生产数量</label>
+                    <input type="number" class="form-control" id="planned_quantity" name="planned_quantity" required>
+                </div>
+            </div>
+            
+            <hr class="my-4">
+            <h5 class="card-title mb-4">生产工序</h5>
+            
+            <div id="process-container">
+                <div class="row process-row mb-2">
+                    <div class="col-md-3">
+                        <input type="text" class="form-control" name="process_name[]" placeholder="工序名称" required>
+                    </div>
+                    <div class="col-md-3">
+                        <input type="text" class="form-control" name="worker_name[]" placeholder="工人姓名" required>
+                    </div>
+                    <div class="col-md-2">
+                        <input type="number" step="0.01" class="form-control" name="unit_price[]" placeholder="单价" required>
+                    </div>
+                    <div class="col-md-2">
+                        <input type="number" class="form-control" name="sequence[]" placeholder="顺序" required>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="button" class="btn btn-danger remove-row"><i class="bi bi-trash"></i></button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="mb-3">
+                <button type="button" id="add-process" class="btn btn-sm btn-outline-primary">
+                    <i class="bi bi-plus"></i> 添加工序
+                </button>
+            </div>
+            
+            <div class="d-grid gap-2 d-md-flex justify-content-md-end mt-4">
+                <button type="submit" class="btn btn-primary">提交</button>
+                <button type="reset" class="btn btn-outline-secondary">重置</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+  {% extends "base.html" %}
+
+{% block title %}入库管理 - 暖暖生产管理大师{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>入库记录列表</h2>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover">
+                <thead class="table-light">
+                    <tr>
+                        <th>ID</th>
+                        <th>生产计划ID</th>
+                        <th>服装款号</th>
+                        <th>实际入库</th>
+                        <th>残次品</th>
+                        <th>残次品回收</th>
+                        <th>入库日期</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for inventory in inventories %}
+                    <tr>
+                        <td>{{ inventory.id }}</td>
+                        <td>{{ inventory.production_id }}</td>
+                        <td>{{ inventory.production.clothing.code }}</td>
+                        <td>{{ inventory.actual_quantity }}</td>
+                        <td>{{ inventory.defective_quantity }}</td>
+                        <td>
+                            {% if inventory.defective_recycled %}
+                            <span class="badge bg-success">是</span>
+                            {% else %}
+                            <span class="badge bg-secondary">否</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ inventory.created_at.strftime('%Y-%m-%d') }}</td>
+                        <td>
+                            <a href="{{ url_for('cost_calculation', clothing_id=inventory.production.clothing.id) }}" class="btn btn-sm btn-info" title="成本计算">
+                                <i class="bi bi-calculator"></i>
+                            </a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+  {% extends "base.html" %}
+
+{% block title %}添加入库记录 - 暖暖生产管理大师{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>添加入库记录</h2>
+    <a href="{{ url_for('inventory_list') }}" class="btn btn-outline-secondary">
+        <i class="bi bi-arrow-left"></i> 返回列表
+    </a>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <form method="POST">
+            <h5 class="card-title mb-4">生产信息</h5>
+            
+            <div class="row mb-3">
+                <div class="col-md-6">
+                    <label class="form-label">服装款号</label>
+                    <input type="text" class="form-control" value="{{ production.clothing.code }}" readonly>
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label">计划生产数量</label>
+                    <input type="text" class="form-control" value="{{ production.planned_quantity }}" readonly>
+                </div>
+            </div>
+            
+            <hr class="my-4">
+            <h5 class="card-title mb-4">入库信息</h5>
+            
+            <div class="row mb-3">
+                <div class="col-md-6">
+                    <label for="actual_quantity" class="form-label">实际入库数量</label>
+                    <input type="number" class="form-control" id="actual_quantity" name="actual_quantity" required>
+                </div>
+                <div class="col-md-6">
+                    <label for="defective_quantity" class="form-label">残次品数量</label>
+                    <input type="number" class="form-control" id="defective_quantity" name="defective_quantity" value="0">
+                </div>
+            </div>
+            
+            <div class="mb-3 form-check">
+                <input type="checkbox" class="form-check-input" id="defective_recycled" name="defective_recycled">
+                <label class="form-check-label" for="defective_recycled">残次品已回收</label>
+            </div>
+            
+            <div class="mb-3">
+                <label for="notes" class="form-label">备注</label>
+                <textarea class="form-control" id="notes" name="notes" rows="3"></textarea>
+            </div>
+            
+            <div class="d-grid gap-2 d-md-flex justify-content-md-end mt-4">
+                <button type="submit" class="btn btn-primary">提交</button>
+                <button type="reset" class="btn btn-outline-secondary">重置</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: #f8f9fa;
+}
+
+.wrapper {
+    display: flex;
+    width: 100%;
+    align-items: stretch;
+}
+
+#sidebar {
+    min-width: 250px;
+    max-width: 250px;
+    min-height: 100vh;
+    transition: all 0.3s;
+}
+
+#sidebar.active {
+    margin-left: -250px;
+}
+
+#sidebar .sidebar-header {
+    padding: 20px;
+    background: #343a40;
+}
+
+#sidebar ul.components {
+    padding: 20px 0;
+}
+
+#sidebar ul li a {
+    padding: 10px 15px;
+    display: block;
+    text-decoration: none;
+}
+
+#sidebar ul li a:hover {
+    background: #495057;
+}
+
+#sidebar ul li.active > a {
+    color: #fff;
+    background: #6c757d;
+}
+
+#content {
+    width: 100%;
+    min-height: 100vh;
+    transition: all 0.3s;
+}
+
+.navbar {
+    padding: 15px 10px;
+    background: #fff;
+    border: none;
+    border-radius: 0;
+    margin-bottom: 0;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+}
+
+.navbar-btn {
+    box-shadow: none;
+    outline: none !important;
+    border: none;
+}
+
+.card {
+    border: none;
+    box-shadow: 0 0.15rem 1.75rem 0 rgba(33, 40, 50, 0.15);
+    margin-bottom: 24px;
+}
+
+.card-header {
+    background-color: #f8f9fa;
+    border-bottom: 1px solid #e3e6f0;
+    padding: 1rem 1.35rem;
+}
+
+.card-body {
+    padding: 1.5rem;
+}
+
+.table-responsive {
+    overflow-x: auto;
+}
+
+.table {
+    width: 100%;
+    margin-bottom: 1rem;
+    color: #212529;
+}
+
+.table th {
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    letter-spacing: 0.5px;
+}
+
+.badge {
+    font-weight: 500;
+    padding: 0.35em 0.65em;
+    font-size: 0.75em;
+}
+
+.btn-primary {
+    background-color: #4e73df;
+    border-color: #4e73df;
+}
+
+.btn-primary:hover {
+    background-color: #2e59d9;
+    border-color: #2653d4;
+}
+
+.btn-outline-secondary:hover {
+    color: #fff;
+    background-color: #6c757d;
+    border-color: #6c757d;
+}
+
+.alert {
+    border-radius: 0.35rem;
+}
+
+@media (max-width: 768px) {
+    #sidebar {
+        margin-left: -250px;
+    }
+    #sidebar.active {
+        margin-left: 0;
+    }
+}
+  $(document).ready(function () {
+    // Sidebar toggle
+    $('#sidebarCollapse').on('click', function () {
+        $('#sidebar').toggleClass('active');
+    });
+
+    // Auto-hide sidebar on small screens
+    $(window).resize(function() {
+        if ($(window).width() < 768) {
+            $('#sidebar').addClass('active');
+        } else {
+            $('#sidebar').removeClass('active');
+        }
+    });
+
+    // Initialize tooltips
+    $('[data-bs-toggle="tooltip"]').tooltip();
+
+    // Close alert after 5 seconds
+    setTimeout(function() {
+        $('.alert').alert('close');
+    }, 5000);
+});
+          
